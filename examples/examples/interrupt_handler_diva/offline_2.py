@@ -1,100 +1,197 @@
-
-
+import os
 import re
-import soundfile as sf   # <-- replaces librosa
 import numpy as np
+import soundfile as sf
 import torch
+import asyncio
+from datetime import datetime, timezone
 from transformers import WhisperProcessor, WhisperForConditionalGeneration
 
-# ======================================================
-#              CONFIG
-# ======================================================
+# ============================================================
+#  CONFIG (dynamic filler + command lists)
+# ============================================================
+
+IGNORED_FILLERS = set(
+    w.strip().lower() for w in
+    (os.getenv("IGNORED_FILLERS", "uh,umm,hmm,haan,huh,erm,mmm")).split(",")
+)
+
+COMMAND_WORDS = set(
+    w.strip().lower() for w in
+    (os.getenv("COMMAND_WORDS", "stop,wait,hold on,no,not that,cancel")).split(",")
+)
+
+# ============================================================
+#  LOAD WHISPER MODEL
+# ============================================================
 
 WHISPER_MODEL = "openai/whisper-small"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-
-IGNORED_FILLERS = {"uh", "umm", "hmm", "haan", "huh", "erm", "mmm"}
-COMMAND_WORDS = {"stop", "wait", "hold on", "no", "not that", "cancel"}
-
-# ======================================================
-#               LOAD WHISPER
-# ======================================================
 
 processor = WhisperProcessor.from_pretrained(WHISPER_MODEL)
 whisper = WhisperForConditionalGeneration.from_pretrained(WHISPER_MODEL).to(DEVICE)
 whisper.eval()
 
-# ======================================================
-#                  HELPERS
-# ======================================================
+# ============================================================
+#  HELPERS
+# ============================================================
 
-def normalize(t):
-    t = t.lower().strip()
-    t = re.sub(r"[^a-zA-Z0-9\s']", " ", t)
-    return re.sub(r"\s+", " ", t)
+def utc_ts():
+    return datetime.now(timezone.utc).isoformat()
 
+def normalize(text: str):
+    text = text.lower().strip()
+    text = re.sub(r"[^a-zA-Z0-9\s']", " ", text)
+    return re.sub(r"\s+", " ", text)
 
-def classify_interrupt(text, agent_speaking=True):
+async def transcribe_full_audio(audio_np):
+    """Stable + non-hallucination Whisper mode."""
+    inputs = processor(
+        audio_np,
+        sampling_rate=16000,
+        return_tensors="pt"
+    ).input_features.to(DEVICE)
+
+    with torch.no_grad():
+        ids = whisper.generate(
+            inputs,
+            task="transcribe",
+            language="en",
+            temperature=0.0,
+            do_sample=False,
+            repetition_penalty=1.2,
+            no_repeat_ngram_size=4,
+        )
+
+    text = processor.batch_decode(ids, skip_special_tokens=True)[0]
+    return text.strip()
+
+# ============================================================
+#  CLASSIFIER
+# ============================================================
+
+def classify_interrupt(text, agent_speaking):
     t = normalize(text)
     tokens = t.split()
 
     if not agent_speaking:
         return "VALID", "agent not speaking"
 
+    # Pure filler
     if len(tokens) > 0 and all(tok in IGNORED_FILLERS for tok in tokens):
         return "IGNORE", "pure filler"
 
-    for cmd in COMMAND_WORDS:
-        if cmd in t:
-            return "INTERRUPT", f"command '{cmd}'"
+    # Commands
+    for phrase in sorted(COMMAND_WORDS, key=lambda x: -len(x)):
+        if phrase in t:
+            return "INTERRUPT", f"command '{phrase}'"
 
-    return "INTERRUPT", "meaningful speech"
+    # Any meaningful speech
+    if len(t.strip()) > 0:
+        return "INTERRUPT", "meaningful speech"
 
+    return "IGNORE", "empty or noise"
 
-# ======================================================
-#               FIXED NON-HALLUCINATING WHISPER
-# ======================================================
+# ============================================================
+#  LIVEKIT HANDLER
+# ============================================================
 
-def transcribe(audio):
-    features = processor(audio, sampling_rate=16000, return_tensors="pt").input_features.to(DEVICE)
+class InterruptionHandler:
+    def __init__(self, agent):
+        self.agent = agent
+        self.buffer = []
+        self.sr = 16000
 
-    with torch.no_grad():
-        pred_ids = whisper.generate(
-            features,
-            max_new_tokens=200,
-            temperature=0.0,
-            repetition_penalty=1.0,
-            no_repeat_ngram_size=3
-        )
+    async def on_audio_frame(self, pcm_float32: np.ndarray, agent_speaking: bool):
+        self.buffer.append(pcm_float32)
 
-    text = processor.batch_decode(pred_ids, skip_special_tokens=True)[0]
-    return text
+        if len(self.buffer) < 4:  # ~400ms
+            return
 
+        audio = np.concatenate(self.buffer)
+        self.buffer = []
 
-# ======================================================
-#                       MAIN
-# ======================================================
+        text = await transcribe_full_audio(audio)
 
-def main(audio_path):
-    audio, sr = sf.read(audio_path)     # <---- soundfile loader (no numba issues)
+        print({
+            "ts": utc_ts(),
+            "event": "FRAME_TRANSCRIBED",
+            "text": text,
+            "agent_speaking": agent_speaking
+        })
 
-    if sr != 16000:
+        decision, reason = classify_interrupt(text, agent_speaking)
+
+        print({
+            "ts": utc_ts(),
+            "event": "INTERRUPT_EVAL",
+            "decision": decision,
+            "reason": reason
+        })
+
+        if decision == "INTERRUPT" and agent_speaking:
+            print({"ts": utc_ts(), "event": "ACTION_STOP_TTS"})
+            await self.agent.stop_tts()
+
+# ============================================================
+#  SAFE AUDIO LOADER (NO LIBROSA)
+# ============================================================
+
+def load_audio_safe(path, sr=16000):
+    audio, orig_sr = sf.read(path)
+
+    # Convert stereo → mono
+    if len(audio.shape) > 1:
+        audio = np.mean(audio, axis=1)
+
+    # Resample if needed
+    if orig_sr != sr:
         import scipy.signal
-        audio = scipy.signal.resample_poly(audio, 16000, sr)
-        sr = 16000
+        audio = scipy.signal.resample_poly(audio, sr, orig_sr)
 
-    audio = audio.astype(np.float32)
+    return audio.astype(np.float32)
 
-    text = transcribe(audio)
-    print("\nWhisper Transcript:", text)
+# ============================================================
+#  OFFLINE TEST DRIVER
+# ============================================================
 
-    decision, reason = classify_interrupt(text, agent_speaking=True)
+async def test_file(agent, path):
+    handler = InterruptionHandler(agent)
 
-    print("\n=== FINAL DECISION ===")
-    print("Decision:", decision)
-    print("Reason:", reason)
+    audio = load_audio_safe(path, sr=16000)
+    frame = 16000 // 2  # 0.5s
 
+    await agent.start_tts()
+
+    for i in range(0, len(audio), frame):
+        chunk = audio[i:i+frame]
+        await handler.on_audio_frame(chunk, agent_speaking=True)
+
+    await agent.end_tts()
+
+# ============================================================
+#  MOCK AGENT FOR TESTING
+# ============================================================
+
+class MockAgent:
+    async def start_tts(self):
+        print({"ts": utc_ts(), "event": "AGENT_TTS_START"})
+
+    async def stop_tts(self):
+        print({"ts": utc_ts(), "event": "AGENT_TTS_STOP"})
+
+    async def end_tts(self):
+        print({"ts": utc_ts(), "event": "AGENT_TTS_END"})
+
+# ============================================================
+#  MAIN
+# ============================================================
 
 if __name__ == "__main__":
-    main("WhatsApp Ptt 2025-11-18 at 3.47.10 PM.ogg")
+    import sys
+    if len(sys.argv) != 2:
+        print("Usage: python interrupt_handler.py <audiofile>")
+        exit()
 
+    agent = MockAgent()
+    asyncio.run(test_file(agent, sys.argv[1]))
